@@ -7,9 +7,12 @@
   collateral: uint, 
   due-height: uint, 
   repaid: bool,
-  interest-rate: uint,  ;; Interest rate in basis points (e.g., 500 = 5%)
-  amount-repaid: uint,  ;; Track partial repayments
-  created-height: uint  ;; When loan was created for interest calculation
+  interest-rate: uint,           ;; Interest rate in basis points (e.g., 500 = 5%)
+  amount-repaid: uint,           ;; Track cumulative repayments
+  created-height: uint,          ;; When loan was created for interest calculation
+  outstanding-principal: uint,   ;; Remaining principal after repayments
+  accrued-interest: uint,        ;; Interest accrued but not yet paid
+  last-accrued-height: uint      ;; Last block height where interest was accrued
 })
 
 ;; Collateral vault to hold borrower's collateral
@@ -60,6 +63,53 @@
 (define-private (min-value (a uint) (b uint))
   (if (<= a b) a b))
 
+;; Calculate additional interest accrued between the last accrual height and a target height
+(define-private (compute-accrual (loan (tuple (borrower principal)
+                                              (lender (optional principal))
+                                              (principal uint)
+                                              (collateral uint)
+                                              (due-height uint)
+                                              (repaid bool)
+                                              (interest-rate uint)
+                                              (amount-repaid uint)
+                                              (created-height uint)
+                                              (outstanding-principal uint)
+                                              (accrued-interest uint)
+                                              (last-accrued-height uint)))
+                                 (target-height uint))
+  (let (
+        (rate (get interest-rate loan))
+        (outstanding (get outstanding-principal loan))
+        (last-height (get last-accrued-height loan)))
+    (if (or (is-eq rate u0)
+            (is-eq outstanding u0)
+            (<= target-height last-height))
+        u0
+        (let ((blocks-elapsed (- target-height last-height)))
+          (/ (* (* outstanding rate) blocks-elapsed)
+             (* BASIS-POINTS BLOCKS-PER-DAY))))))
+
+;; Update a loan tuple with newly accrued interest up to the current block height
+(define-private (update-loan-accrual (loan (tuple (borrower principal)
+                                                  (lender (optional principal))
+                                                  (principal uint)
+                                                  (collateral uint)
+                                                  (due-height uint)
+                                                  (repaid bool)
+                                                  (interest-rate uint)
+                                                  (amount-repaid uint)
+                                                  (created-height uint)
+                                                  (outstanding-principal uint)
+                                                  (accrued-interest uint)
+                                                  (last-accrued-height uint))))
+  (let ((accrual (compute-accrual loan stacks-block-height)))
+    (if (is-eq accrual u0)
+        (merge loan { last-accrued-height: stacks-block-height })
+        (merge loan {
+          accrued-interest: (+ (get accrued-interest loan) accrual),
+          last-accrued-height: stacks-block-height
+        }))))
+
 ;; Original create-loan function (backward compatible)
 (define-public (create-loan (id uint) (principal uint) (collateral uint) (due uint))
   (create-loan-with-interest id principal collateral due u0))
@@ -85,7 +135,10 @@
       repaid: false,
       interest-rate: interest-rate,
       amount-repaid: u0,
-      created-height: stacks-block-height
+      created-height: stacks-block-height,
+      outstanding-principal: principal,
+      accrued-interest: u0,
+      last-accrued-height: stacks-block-height
     })
     (ok true)))
 
@@ -93,7 +146,7 @@
 (define-public (create-loan-with-collateral (id uint) (principal uint) (collateral-amount uint) (due uint) (interest-rate uint))
   (begin
     ;; Validate collateral ratio (collateral must be at least 120% of principal)
-    (asserts! (>= (* collateral-amount u100) (* principal MIN-COLLATERAL-RATIO)) ERR-INSUFFICIENT-COLLATERAL)
+    (asserts! (>= (* collateral-amount BASIS-POINTS) (* principal MIN-COLLATERAL-RATIO)) ERR-INSUFFICIENT-COLLATERAL)
     ;; Validate collateral vault doesn't exist
     (asserts! (is-none (map-get? collateral-vault id)) ERR-COLLATERAL-EXISTS)
     
@@ -142,7 +195,10 @@
                   repaid: false,
                   interest-rate: (get interest-rate val),
                   amount-repaid: (get amount-repaid val),
-                  created-height: (get created-height val)
+                  created-height: (get created-height val),
+                  outstanding-principal: (get outstanding-principal val),
+                  accrued-interest: (get accrued-interest val),
+                  last-accrued-height: (get last-accrued-height val)
                 })
                 (ok true))
             error ERR-TRANSFER-FAILED))
@@ -171,30 +227,36 @@
           (asserts! (is-eq tx-sender (get borrower val)) ERR-NOT-BORROWER)
           ;; Validate minimum payment amount
           (asserts! (> amount u0) ERR-INSUFFICIENT-PAYMENT)
-          
-          (let ((lender-principal (unwrap-panic (get lender val)))
-                (total-owed (calculate-total-owed id))
-                (new-amount-repaid (+ (get amount-repaid val) amount))
-                (is-fully-repaid (>= new-amount-repaid total-owed)))
-            
-            ;; Transfer payment from borrower to lender
-            (match (stx-transfer? amount tx-sender lender-principal)
-              success
-                (begin
-                  ;; Update loan with new repayment amount
-                  (map-set loans id { 
-                    borrower: (get borrower val), 
-                    lender: (get lender val), 
-                    principal: (get principal val), 
-                    collateral: (get collateral val), 
-                    due-height: (get due-height val), 
-                    repaid: is-fully-repaid,
-                    interest-rate: (get interest-rate val),
-                    amount-repaid: new-amount-repaid,
-                    created-height: (get created-height val)
-                  })
-                  (ok is-fully-repaid))
-              error ERR-TRANSFER-FAILED)))
+          (let (
+                (loan-with-accrual (update-loan-accrual val))
+                (lender-principal (unwrap-panic (get lender val)))
+                (outstanding (get outstanding-principal loan-with-accrual))
+                (accrued (get accrued-interest loan-with-accrual))
+                (total-owed (+ outstanding accrued)))
+            ;; Prevent extra repayments when the loan is already settled
+            (asserts! (> total-owed u0) ERR-ALREADY-REPAID)
+            (let (
+                  (payment-to-interest (min-value amount accrued))
+                  (remaining-after-interest (- amount payment-to-interest))
+                  (new-accrued (- accrued payment-to-interest))
+                  (payment-to-principal (min-value remaining-after-interest outstanding))
+                  (new-outstanding (- outstanding payment-to-principal))
+                  (new-amount-repaid (+ (get amount-repaid loan-with-accrual) amount))
+                  (fully-repaid (and (is-eq new-outstanding u0) (is-eq new-accrued u0))))
+              ;; Transfer payment from borrower to lender
+              (match (stx-transfer? amount tx-sender lender-principal)
+                success
+                  (begin
+                    ;; Update loan with refreshed accrual data and new balances
+                    (map-set loans id 
+                      (merge loan-with-accrual { 
+                        outstanding-principal: new-outstanding,
+                        accrued-interest: new-accrued,
+                        amount-repaid: new-amount-repaid,
+                        repaid: fully-repaid
+                      }))
+                    (ok fully-repaid))
+                error ERR-TRANSFER-FAILED))))
       ERR-LOAN-NOT-FOUND)))
 
 ;; Release collateral when loan is fully repaid
@@ -247,8 +309,10 @@
                   ;; Only lender can liquidate
                   (asserts! (is-eq tx-sender (unwrap-panic (get lender loan-val))) ERR-UNAUTHORIZED-LIQUIDATION)
                   
-                  (let ((lender-principal (unwrap-panic (get lender loan-val)))
-                        (total-owed (calculate-total-owed id))
+                  (let ((loan-with-accrual (update-loan-accrual loan-val))
+                        (lender-principal (unwrap-panic (get lender loan-with-accrual)))
+                        (total-owed (+ (get outstanding-principal loan-with-accrual)
+                                       (get accrued-interest loan-with-accrual)))
                         (penalty-amount (/ (* (get amount collateral-val) (get liquidation-penalty liquidation-val)) BASIS-POINTS))
                         (collateral-to-lender (min-value (get amount collateral-val) (+ total-owed penalty-amount))))
                     
@@ -264,7 +328,12 @@
                                 remaining-success
                                   (begin
                                     ;; Mark loan as repaid and clean up
-                                    (map-set loans id (merge loan-val { repaid: true }))
+                                    (map-set loans id (merge loan-with-accrual { 
+                                      repaid: true,
+                                      outstanding-principal: u0,
+                                      accrued-interest: u0,
+                                      last-accrued-height: stacks-block-height
+                                    }))
                                     (map-delete collateral-vault id)
                                     (map-delete liquidation-settings id)
                                     (ok true))
@@ -272,7 +341,12 @@
                               ;; No remaining collateral, proceed with cleanup
                               (begin
                                 ;; Mark loan as repaid and clean up
-                                (map-set loans id (merge loan-val { repaid: true }))
+                                (map-set loans id (merge loan-with-accrual { 
+                                  repaid: true,
+                                  outstanding-principal: u0,
+                                  accrued-interest: u0,
+                                  last-accrued-height: stacks-block-height
+                                }))
                                 (map-delete collateral-vault id)
                                 (map-delete liquidation-settings id)
                                 (ok true))))
@@ -285,16 +359,9 @@
 (define-read-only (calculate-total-owed (id uint))
   (match (map-get? loans id)
     loan-data
-      (let ((principal (get principal loan-data))
-            (interest-rate (get interest-rate loan-data))
-            (blocks-elapsed (- stacks-block-height (get created-height loan-data))))
-        ;; Simple interest calculation: principal + (principal * rate * time / basis-points)
-        ;; Time is calculated in days (blocks / BLOCKS_PER_DAY)
-        (if (is-eq interest-rate u0)
-            principal  ;; No interest if rate is 0
-            (+ principal 
-               (/ (* (* principal interest-rate) blocks-elapsed) 
-                  (* BASIS-POINTS BLOCKS-PER-DAY)))))
+      (let ((additional-interest (compute-accrual loan-data stacks-block-height)))
+        (+ (get outstanding-principal loan-data)
+           (+ (get accrued-interest loan-data) additional-interest)))
     u0))
 
 ;; Read-only function to get loan details
@@ -314,14 +381,7 @@
 
 ;; Get remaining balance owed
 (define-read-only (get-remaining-balance (id uint))
-  (match (map-get? loans id)
-    loan-data
-      (let ((total-owed (calculate-total-owed id))
-            (amount-repaid (get amount-repaid loan-data)))
-        (if (>= amount-repaid total-owed)
-            u0
-            (- total-owed amount-repaid)))
-    u0))
+  (calculate-total-owed id))
 
 ;; Check if loan is liquidatable
 (define-read-only (is-liquidatable (id uint))
